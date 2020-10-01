@@ -17,6 +17,8 @@ namespace Rnwood.Smtp4dev.DbModel
         [Key]
         public Guid Id { get; set; }
 
+        public long ImapUid { get; internal set; }
+
         public string From { get; set; }
         public string To { get; set; }
         public DateTime ReceivedDate { get; set; }
@@ -31,5 +33,6 @@ namespace Rnwood.Smtp4dev.DbModel
         public int AttachmentCount { get; set; }
 
         public bool IsUnread { get; set; }
+        public string RelayError { get; internal set; }
     }
 }

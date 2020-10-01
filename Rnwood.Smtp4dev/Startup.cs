@@ -1,10 +1,8 @@
 using System;
 using System.IO;
-using System.Threading.Tasks;
-
+using System.Net;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
-using Microsoft.AspNetCore.SpaServices.Webpack;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -13,7 +11,11 @@ using Microsoft.Extensions.Logging;
 using Rnwood.Smtp4dev.DbModel;
 using Rnwood.Smtp4dev.Hubs;
 using Rnwood.Smtp4dev.Server;
-using Microsoft.Net.Http.Headers;
+using VueCliMiddleware;
+using Microsoft.Extensions.Hosting;
+using Microsoft.AspNetCore.SpaServices;
+using MailKit.Net.Smtp;
+using Microsoft.AspNetCore.Rewrite;
 
 namespace Rnwood.Smtp4dev
 {
@@ -29,96 +31,130 @@ namespace Rnwood.Smtp4dev
         // This method gets called by the runtime. Use this method to add services to the container.
         public void ConfigureServices(IServiceCollection services)
         {
+            services.Configure<ServerOptions>(Configuration.GetSection("ServerOptions"));
+            services.Configure<RelayOptions>(Configuration.GetSection("RelayOptions"));
+
             ServerOptions serverOptions = Configuration.GetSection("ServerOptions").Get<ServerOptions>();
 
-            services.AddMvc();
-
-            services.AddDbContext<Smtp4devDbContext>(opt => {
-
-                if (string.IsNullOrEmpty(serverOptions.Database) )
+            services.AddDbContext<Smtp4devDbContext>(opt =>
+            {
+                if (string.IsNullOrEmpty(serverOptions.Database))
                 {
                     Console.WriteLine("Using in memory database.");
                     opt.UseInMemoryDatabase("main");
                 }
                 else
                 {
+                    if (serverOptions.RecreateDb && File.Exists(serverOptions.Database))
+                    {
+                        Console.WriteLine("Deleting Sqlite database.");
+                        File.Delete(serverOptions.Database);
+                    }
+
                     Console.WriteLine("Using Sqlite database at " + Path.GetFullPath(serverOptions.Database));
                     opt.UseSqlite($"Data Source='{serverOptions.Database}'");
                 }
             }, ServiceLifetime.Transient, ServiceLifetime.Singleton);
 
             services.AddSingleton<Smtp4devServer>();
-			services.AddSingleton<IMessagesRepository>(sp => sp.GetService<Smtp4devServer>());
+            services.AddSingleton<ImapServer>();
+            services.AddSingleton<IMessagesRepository>(sp => sp.GetService<Smtp4devServer>());
             services.AddSingleton<Func<Smtp4devDbContext>>(sp => (() => sp.GetService<Smtp4devDbContext>()));
 
-            services.Configure<ServerOptions>(Configuration.GetSection("ServerOptions"));
+            services.AddSingleton<Func<RelayOptions, SmtpClient>>((relayOptions) =>
+            {
+                if (!relayOptions.IsEnabled)
+                {
+                    return null;
+                }
+
+                SmtpClient result = new SmtpClient();
+                result.Connect(relayOptions.SmtpServer, relayOptions.SmtpPort);
+
+                if (!string.IsNullOrEmpty(relayOptions.Login))
+                {
+                    result.Authenticate(relayOptions.Login, relayOptions.Password);
+                }
+
+                return result;
+            });
+
 
             services.AddSignalR();
+            services.AddSingleton<NotificationsHub>();
 
-            services.AddSingleton<MessagesHub>();
-            services.AddSingleton<SessionsHub>();
+            services.AddControllers();
+
+            services.AddSpaStaticFiles(o => o.RootPath = "ClientApp");
+
         }
 
 
         // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.
-        public void Configure(IApplicationBuilder app, IHostingEnvironment env, ILoggerFactory log)
+        public void Configure(IApplicationBuilder app, IWebHostEnvironment env, ILoggerFactory log)
         {
             ServerOptions serverOptions = Configuration.GetSection("ServerOptions").Get<ServerOptions>();
 
+            app.UseRouting();
 
-            Action<IApplicationBuilder> configure = subdir => {
-
-            subdir.UseExceptionHandler(new ExceptionHandlerOptions
+            Action<IApplicationBuilder> configure = subdir =>
             {
-                ExceptionHandler = new JsonExceptionMiddleware().Invoke
-            });
+                subdir.UseRouting();
+                subdir.UseDeveloperExceptionPage();
+                subdir.UseDefaultFiles();
+                subdir.UseStaticFiles();
+                subdir.UseSpaStaticFiles();
 
-            subdir.UseDefaultFiles();
+                subdir.UseWebSockets();
 
-			if (env.IsDevelopment()) {
-			    subdir.UseWebpackDevMiddleware(new WebpackDevMiddlewareOptions
+                subdir.UseEndpoints(e =>
                 {
-                    HotModuleReplacement = true
+                    e.MapHub<NotificationsHub>("/hubs/notifications");
+
+                    e.MapControllers();
+                    if (env.IsDevelopment())
+                    {
+                        e.MapToVueCliProxy(
+                        "{*path}",
+                        new SpaOptions { SourcePath = Path.Join(env.ContentRootPath, "ClientApp") },
+                        npmScript: "serve",
+                        regex: "Compiled successfully",
+                        forceKill: true,
+                        port: 8123
+                        );
+                    }
                 });
-			}
-
-            subdir.UseStaticFiles();
-
-            subdir.UseWebSockets();
-            subdir.UseSignalR(routes =>
-            {
-                routes.MapHub<MessagesHub>("/hubs/messages");
-                routes.MapHub<SessionsHub>("/hubs/sessions");
-            });
-
-            subdir.UseMvc(routes =>
-            {
-                routes.MapRoute(
-                    name: "default",
-                    template: "{controller=Home}/{action=Index}/{id?}");
-
-                routes.MapSpaFallbackRoute(
-                    name: "spa-fallback",
-                    defaults: new { controller = "Home", action = "Index" });
-            });
 
 
-            Smtp4devDbContext context = subdir.ApplicationServices.GetService<Smtp4devDbContext>();
-            if (!context.Database.IsInMemory())
-            {
-                context.Database.Migrate();
-            }
 
-            subdir.ApplicationServices.GetService<Smtp4devServer>().Start();
+
+
+                Smtp4devDbContext context = subdir.ApplicationServices.GetService<Smtp4devDbContext>();
+                if (!context.Database.IsInMemory())
+                {
+                    context.Database.Migrate();
+                }
+
+                subdir.ApplicationServices.GetService<Smtp4devServer>().TryStart();
+                subdir.ApplicationServices.GetService<ImapServer>().TryStart();
             };
 
-            if (!string.IsNullOrEmpty(serverOptions.RootUrl))
+            if (!string.IsNullOrEmpty(serverOptions.BasePath) && serverOptions.BasePath != "/")
             {
-                app.Map(serverOptions.RootUrl, configure);
-            } else {
+                RewriteOptions rewrites = new RewriteOptions();
+                rewrites.AddRedirect("^" + serverOptions.BasePath.TrimEnd('/') + "$", serverOptions.BasePath.TrimEnd('/') + "/"); ;
+                rewrites.AddRedirect("^(/)?$", serverOptions.BasePath.TrimEnd('/') + "/"); ;
+                app.UseRewriter(rewrites);
+
+                app.Map(serverOptions.BasePath, configure);
+            }
+            else
+            {
                 configure(app);
             }
+
+
         }
-        
+
     }
 }
